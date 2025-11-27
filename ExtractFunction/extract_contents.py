@@ -1,138 +1,130 @@
 import json
-import os 
+import os
+import uuid
+import boto3
 import requests
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from markdownify import markdownify as md 
 
 # --- CẤU HÌNH ---
-# Thông tin xác thực API Google (lưu dưới dạng biến môi trường trong Lambda)
-# Bạn cần tạo một tệp credentials.json từ Google Cloud Console
-# và lưu nội dung của nó vào một biến môi trường Lambda.
-GOOGLE_API_CREDENTIALS = json.loads(os.environ['GOOGLE_CREDENTIALS'])
-SCOPES = ['https://www.googleapis.com/auth/documents.readonly']
+S3_BUCKET = os.environ.get('S3_BUCKET_NAME')
+s3_client = boto3.client('s3')
 
-def get_aws_blog_content(url):
-    """Trích xuất siêu dữ liệu (metadata) và nội dung từ một URL blog của AWS."""
+# Google Creds
+try:
+    GOOGLE_API_CREDENTIALS = json.loads(os.environ.get('GOOGLE_CREDENTIALS', '{}'))
+except json.JSONDecodeError:
+    GOOGLE_API_CREDENTIALS = {}
+
+# [THAY ĐỔI 1]: Đổi Scope sang Drive để có quyền Export file
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+
+def get_aws_blog_markdown(url):
+    """Trích xuất HTML AWS và chuyển sang Markdown."""
+    if not url or not url.startswith('http'):
+        return None, "Invalid URL"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
-
-        # 1. Trích xuất Tiêu đề
-        title_element = soup.select_one('h1.blog-post-title')
-        title = title_element.get_text(strip=True) if title_element else "Không tìm thấy tiêu đề."
-
-        # 2. Trích xuất thông tin từ footer.blog-post-meta
-        meta_element = soup.select_one('footer.blog-post-meta')
-        authors = "Không tìm thấy tác giả."
-        post_date = "Không tìm thấy ngày đăng."
-        categories = []
-
-        if meta_element:
-            # Tác giả: nằm trong span đầu tiên, bắt đầu bằng "by "
-            author_span = meta_element.find('span')
-            if author_span:
-                author_text = author_span.get_text(strip=True)
-                if author_text.startswith('by '):
-                    authors = author_text[3:]  # Loại bỏ "by "
-
-            # Ngày đăng: nằm trong thẻ <time>
-            time_element = meta_element.find('time')
-            if time_element:
-                post_date = time_element.get_text(strip=True)
-
-            # Danh mục: tìm tất cả các thẻ <a> trong meta (trừ Permalink, Comments, Share)
-            all_links = meta_element.find_all('a')
-            exclude_texts = ['Permalink', 'Comments']
-            for link in all_links:
-                link_text = link.get_text(strip=True)
-                if link_text not in exclude_texts and 'Share' not in link_text:
-                    # Lấy text của thẻ a, đây là danh mục
-                    categories.append(link_text)
-
-        # 3. Trích xuất nội dung chính
-        article_body_element = soup.select_one('article .blog-post-content')
-        content = article_body_element.get_text(separator='\n', strip=True) if article_body_element else "Không tìm thấy nội dung."
         
-        # 4. Trả về một dictionary chứa tất cả thông tin
-        return {
-            'title': title,
-            'authors': authors,
-            'post_date': post_date,
-            'categories': categories,
-            'content': content
-        }
-            
-    except requests.RequestException as e:
-        return {
-            'title': "Lỗi",
-            'authors': "Lỗi", 
-            'post_date': "Lỗi",
-            'categories': [],
-            'content': f"Lỗi khi truy cập URL blog AWS: {e}"
-        }
+        article_body = soup.select_one('article .blog-post-content')
+        if not article_body:
+            return None, "Content not found"
 
-def get_google_doc_content(url):
-    """Trích xuất nội dung văn bản từ một URL Google Docs."""
+        markdown_text = md(str(article_body), heading_style="ATX", strip=['script', 'style'])
+        return markdown_text.strip(), None
+    except Exception as e:
+        return None, str(e)
+
+def get_google_doc_markdown_via_export(url):
+    """
+    [LOGIC MỚI]: Dùng Drive API export ra HTML -> convert sang Markdown
+    """
+    if not url or 'docs.google.com/document/d/' not in url:
+        return None, "Invalid Google Doc URL"
     try:
+        if not GOOGLE_API_CREDENTIALS:
+            return None, "Missing Google Credentials"
+        
         creds = service_account.Credentials.from_service_account_info(
             GOOGLE_API_CREDENTIALS, scopes=SCOPES)
         
-        service = build('docs', 'v1', credentials=creds)
+        # [THAY ĐỔI 2]: Build service 'drive' thay vì 'docs'
+        service = build('drive', 'v3', credentials=creds)
         
-        # Trích xuất DOCUMENT_ID từ URL
-        document_id = url.split('/d/')[1].split('/')[0]
-
-        document = service.documents().get(documentId=document_id).execute()
+        # Lấy File ID từ URL
+        file_id = url.split('/d/')[1].split('/')[0]
         
-        content = document.get('body').get('content')
+        # [THAY ĐỔI 3]: Gọi API export sang text/html
+        response = service.files().export(
+            fileId=file_id,
+            mimeType='text/html'
+        ).execute()
         
-        doc_text = ''
-        for value in content:
-            if 'paragraph' in value:
-                elements = value.get('paragraph').get('elements')
-                for elem in elements:
-                    if 'textRun' in elem:
-                        doc_text += elem.get('textRun').get('content')
+        # Response trả về là bytes, decode sang string
+        html_content = response.decode('utf-8')
         
-        return doc_text.strip()
+        # Dùng lại markdownify để chuyển đổi
+        markdown_text = md(html_content, heading_style="ATX")
+        
+        return markdown_text.strip(), None
 
     except Exception as e:
-        return f"Lỗi khi truy cập Google Docs API: {e}"
+        return None, f"Error exporting Google Doc: {str(e)}"
+
+def upload_to_s3(content, folder, file_name):
+    """Hàm upload."""
+    key = f"{folder}/{file_name}"
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=content.encode('utf-8'),
+        ContentType='text/markdown' # Cả 2 giờ đều là Markdown
+    )
+    return key
 
 def lambda_handler(event, context):
-    """Hàm xử lý chính của AWS Lambda."""
-    # Lấy URL từ sự kiện đầu vào
-    aws_blog_url = event.get('aws_blog_url')
-    google_doc_url = event.get('google_doc_url')
+    processed_results = []
+    print(f"Processing {len(event.get('Records', []))} records.")
 
-    if not aws_blog_url or not google_doc_url:
-        return {
-            'statusCode': 400,
-            'body': json.dumps({'error': 'Vui lòng cung cấp cả aws_blog_url và google_doc_url.'})
-        }
-
-    # Trích xuất nội dung
-    aws_content = get_aws_blog_content(aws_blog_url)
-    gdoc_content = get_google_doc_content(google_doc_url)
-
-    # Tạo đối tượng JSON kết quả
-    result = {
-        'aws_blog_content': {
-            'source_url': aws_blog_url,
-            'content': aws_content
-        },
-        'google_doc_translation': {
-            'source_url': google_doc_url,
-            'content': gdoc_content
-        }
-    }
+    for record in event.get('Records', []):
+        try:
+            payload = json.loads(record.get('body', '{}'))
+            aws_url = payload.get('aws_blog_url')
+            doc_url = payload.get('google_doc_url')
+            
+            # 1. Trích xuất (Cả 2 đều ra Markdown)
+            aws_md, aws_err = get_aws_blog_markdown(aws_url)
+            doc_md, doc_err = get_google_doc_markdown_via_export(doc_url)
+            
+            if aws_err or doc_err:
+                print(f"Error extracting: AWS={aws_err}, Doc={doc_err}")
+                continue
+            
+            # 2. Tạo ID
+            article_id = str(uuid.uuid4())[:8]
+            
+            # 3. Upload lên S3 (Cả 2 file đều đuôi .md)
+            original_key = upload_to_s3(aws_md, 'original', f"{article_id}.md")
+            translated_key = upload_to_s3(doc_md, 'translated', f"{article_id}.md")
+            
+            # 4. Output
+            processed_results.append({
+                "article_id": article_id,
+                "s3_bucket": S3_BUCKET,
+                "original_key": original_key,
+                "translated_key": translated_key,
+                "urls": { "aws": aws_url, "doc": doc_url }
+            })
+            
+        except Exception as e:
+            print(f"Critical error processing record: {e}")
+            continue
 
     return {
-        'statusCode': 200,
-        'headers': {
-            'Content-Type': 'application/json'
-        },
-        'body': json.dumps(result, ensure_ascii=False, indent=4)
+        "status": "success",
+        "data": processed_results
     }
